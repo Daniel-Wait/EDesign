@@ -1,0 +1,1168 @@
+/*
+ * myfunctions.c
+ *
+ *  Created on: 01 Apr 2019
+ *      Author: 20887507  20690371
+ */
+#include "myfunctions.h"
+#include "main.h"
+#include "stm32f3xx.h"
+
+volatile uint8_t rx_buffer[100];
+volatile uint8_t rx_index = 0;
+volatile uint8_t rx_data;
+volatile uint8_t end = 0;
+
+
+uint8_t gps_msg[100];
+
+volatile bool rx_flag = false;
+volatile bool gga = false;
+volatile bool valid = false;
+volatile bool parse[14] = {false};
+volatile bool burn = false;
+volatile bool one_sec_msg = false;
+
+int burnoffcounter = 0;
+int burntriggered = 0;
+int burn_long = 0;
+int burn_alt = 0;
+int b = -1;
+
+int previnst = 0;
+
+uint8_t comm[91] = "$20887507,     ,00:00:00,  0,  0,  0,   0,   0,   0,  0.000000,          0,    0.0,  0,  0\n";
+int count = 0;
+
+char tod[10]= {0};
+char latitude[20]= {0};
+char N_S[5]= {0};
+char longitude[20]= {0};
+char E_W[5]= {0};
+char ant_alt[10]= {0};
+char cnt[5] ={0};
+
+double latd = 0;
+double latd_min = 0;
+
+double lontd = 0;
+double lontd_min = 0;
+
+uint32_t pa0_raw;
+uint32_t pa1_raw;
+
+double pa0 = 0;
+double pa1 = 0;
+
+double volt = 0;
+double curr = 0;
+
+const float vdd = 3.35;
+const int num_bits = 255;
+//const float Rsense = 1.1;
+const float Rout = 99.7;
+const int R1 = 1755;
+const int R2 = 66;
+const int R3 = 22000;
+const int R4 = 9770;
+
+int sample = 0;
+double tot_curr = 0;
+double avg_curr = 0;
+int current = 0;
+
+uint8_t bme280_id = 0x76;
+struct bme280_dev dev;
+uint8_t settings_sel;
+struct bme280_data comp_data;
+double pres;
+double temp;
+double humd;
+
+double magn;
+//float accx;
+//float accy;
+//float accz;
+//float total_x = 0;
+//float total_y = 0;
+//float total_z = 0;
+//int stndz = 0;
+int stnd_x;
+int stnd_y;
+int stnd_z;
+
+uint8_t lis2dh12_id = 0x18;
+
+#define SENSOR_BUS hi2c1;
+
+static axis3bit16_t data_raw_acceleration;
+int16_t acceleration_mg[3];
+//static uint8_t whoamI;
+lis2dh12_ctx_t dev_ctx;
+lis2dh12_reg_t reg;
+
+void user_init(void)
+{
+    HAL_UART_Receive_IT(&huart1, (uint8_t*)&rx_data, 1);
+    HAL_TIM_Base_Start_IT(&htim6);
+    lcd_init();
+    sensor_init();
+}
+
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
+	one_sec_msg = true;
+}
+
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+	if(huart->Instance == USART1)
+	{
+
+		if(rx_index >= 100)
+		{
+			rx_index = 0;
+		}
+		if(rx_data == '$')
+		{
+			rx_index = 0;
+			end = 0;
+		}
+
+		if(rx_data == '\n')
+		{
+			rx_flag = true;
+			end = rx_index;
+		}
+
+
+		rx_buffer[rx_index++] = rx_data;
+		HAL_UART_Receive_IT(&huart1, (uint8_t*)&rx_data, 1);
+	}
+
+}
+
+
+void process_buffer(void)
+
+{
+	if(rx_flag == true)
+	{
+		rx_flag = false;
+		rx_index = 0;
+		memset(gps_msg, 0, 100);
+
+		strncpy((char*)gps_msg, (char*)rx_buffer, end+1);
+
+		gga = check_gga((char*)gps_msg);
+
+		if(gga == true)
+		{
+			valid = is_valid((char*)gps_msg, end+1);
+
+			if(valid == true)
+			{
+				split_extract((char*)gps_msg);
+				format_gps();
+			}
+		}
+	}
+}
+
+
+bool check_gga(char *message)
+{
+//If message[0..5] = "$GPGGA", check_GPGGA = true
+	char msg[6];
+	char test[6];
+
+	strncpy(msg,message,6);
+	strcpy(test, "$GPGGA");
+
+	if((test[0] == msg[0])&&(test[1] == msg[1])&&(test[2] == msg[2]))
+	{
+		if((test[3] == msg[3])&&(test[4] == msg[4])&&(test[5] == msg[5]))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+
+bool is_valid(const char *message, int size)
+{
+//If message's, received checksum == calculated checksum, is_valid = true
+	long int crc = 0;
+	int check = 0;
+	int star_index = 0;
+	char* star;
+	char* ptr;
+	char c[4];
+
+	star = strrchr(message, '*');
+	if(star != NULL)
+	{
+		star_index = (int)(star - message);
+		check = check_sum((char*) message, star_index+1);
+		c[0] = '0';
+		c[1] = 'x';
+		c[2] = message[star_index+1];
+		c[3] = message[star_index+2];
+		crc = strtol(c, &ptr, 16);
+		if(crc == check)
+		{
+			return true;
+		}
+
+	}
+
+	return false;
+}
+
+
+int check_sum(const char *message, int length)
+{
+//XOR each character of the string
+	int ret = message[1];
+
+	for(int n = 2; n < length-1; n++)
+	{
+		ret ^= message[n];
+	}
+
+	return ret;
+}
+
+
+void split_extract(char *string)
+{
+//Split NMEA GPGGA Message into fields
+/*
+ * pointer to beginning of string
+ * pointer to first delimiter
+ * if pointers are equal, no value in field, therefore do not parse that field
+ * field's position [0..14] = expected measurement and is parsed for further use
+ * repeat process 14 times to extract all fields
+*/
+    char dst[30]= {0};
+    char *bgn;
+    char *end;
+    int len;
+    int i = 0;
+
+    bgn = string;
+    end = strchr(bgn+1, ',');
+
+    for(i = 0; i < 14; i++)
+    {
+        len = (int)(end - bgn);
+        if(len > 0)
+        {
+            strncpy(dst, bgn, len);
+            parse[i] = true;
+        }
+        else
+        {
+            strcpy(dst, "0");
+            parse[i] = false;
+        }
+
+
+        switch(i)
+        {
+
+			case 1:
+				if(parse[1] == true)
+				{
+					memset(tod, 0, 10);
+					strcpy(tod, dst);
+				}
+				break;
+			case 2:
+				if(parse[2] == true)
+				{
+					memset(latitude, 0, 20);
+					strcpy(latitude, dst);
+				}
+				break;
+			case 3:
+				if(parse[3] == true)
+				{
+					memset(N_S, 0, 5);
+					strcpy(N_S, dst);
+				}
+				break;
+			case 4:
+				if(parse[4] == true)
+				{
+					memset(longitude, 0, 20);
+					strcpy(longitude, dst);
+				}
+				break;
+			case 5:
+				if(parse[5] == true)
+				{
+					memset(E_W, 0, 5);
+					strcpy(E_W, dst);
+				}
+				break;
+			case 9:
+				if(parse[9] == true)
+				{
+					memset(ant_alt, 0, 10);
+					strcpy(ant_alt, dst);
+				}
+				break;
+		}
+
+        memset(dst, 0 ,30);
+        bgn = end+1;
+        end = strchr(bgn, ',');
+    }
+
+   // flag3++;
+}
+
+
+void format_gps(void)
+{
+	int work = 0;
+
+//Write LATITUDE to 1s log message
+/*
+ *convert to float
+ *ddmm.ssssss to dd.mmssssss
+ *format to dd.ffffff
+ *insert .ffffff
+ *insert dd in required format
+ */
+	latd = atof(latitude);
+	latd /= 100.00;
+	work = floor(latd);
+	latd_min = latd - work;
+	latd_min = latd_min*100.0/60.0;
+	latd = work + latd_min;
+
+	comm[55] = '.';
+
+	for(int q = 0; q <= 5; q++)
+	{
+		latd_min *= 10;
+		comm[56+q] = (int)(latd_min)+48;
+		latd_min -= (int)(latd_min);
+	}
+
+	if(latd < 10)
+	{
+		comm[52] = ' ';
+		comm[53] = ' ';
+		comm[54] = latitude[1];
+
+		if(N_S[0] == 'S')
+		{
+			comm[53] = '-';
+		}
+	}
+	else
+	{
+		comm[52] = ' ';
+		comm[53] = latitude[0];
+		comm[54] = latitude[1];
+
+		if(N_S[0] == 'S')
+		{
+			comm[52] = '-';
+		}
+	}
+
+//Write LONGITUDE to 1s log message
+/*
+ *convert to float
+ *dddmm.ssssss to ddd.mmssssss
+ *format to ddd.ffffff
+ *insert .ffffff
+ *insert ddd in required format
+ */
+	lontd = atof(longitude);
+	lontd /= 100.00;
+	work = floor(lontd);
+	lontd_min = lontd - work;
+	lontd_min = lontd_min*100.0/60.0;
+	lontd = work + lontd_min;
+
+
+	comm[67] = '.';
+	for(int p = 0; p <= 5; p++)
+	{
+		lontd_min *= 10;
+		comm[68+p] = (int)(lontd_min)+48;
+		lontd_min -= (int)(lontd_min);
+	}
+
+	if(lontd < 10)
+	{
+		comm[63] = ' ';
+		comm[64] = ' ';
+		comm[65] = ' ';
+		comm[66] = longitude[2];
+
+		if(E_W[0] == 'W')
+		{
+			comm[65] = '-';
+		}
+	}
+	else
+	{
+		if((lontd >= 10) && (lontd < 100))
+		{
+			comm[63] = ' ';
+			comm[64] = ' ';
+			comm[65] = longitude[1];
+			comm[66] = longitude[2];
+
+			if(E_W[0] == 'W')
+			{
+				comm[64] = '-';
+			}
+		}
+		else
+		{
+			comm[63] = ' ';
+			comm[64] = longitude[0];
+			comm[65] = longitude[1];
+			comm[66] = longitude[2];
+
+			if(E_W[0] == 'W')
+			{
+				comm[63] = '-';
+			}
+		}
+	}
+
+//Write TIME OF DAY to 1s log message in format "HH:MM:SS"
+	if(strlen(tod) >= 6)
+	{
+		comm[16] = tod[0];
+		comm[17] = tod[1];
+		comm[18] = ':';
+		comm[19] = tod[2];
+		comm[20] = tod[3];
+		comm[21] =':';
+		comm[22] = tod[4];
+		comm[23] = tod[5];
+	}
+
+//Write ALTITUDE to 1s log message
+	for(int k = 0; k < 7; k++)
+	{
+		comm[75+k] = ant_alt[k];
+	}
+}
+
+
+void format_count(void)
+{
+		bool first = false;
+		if(count >= 99999)
+			{
+				count = 0;
+			}
+
+			cnt[4] = (char)(48+(count%10)/1);
+			cnt[3] = (char)(48+(count%100)/10);
+			cnt[2] = (char)(48+(count%1000)/100);
+			cnt[1] = (char)(48+(count%10000)/1000);
+			cnt[0] = (char)(48+(count%100000)/10000);
+
+			int place = 10;
+			for(int l = 0; l < 5; l++)
+			{
+				if(!first)
+				{
+					if(cnt[l] != 48)
+					{
+						first = true;
+						comm[place++] = cnt[l];
+					}
+				}
+				else
+				{
+					comm[place++] = cnt[l];
+				}
+			}
+}
+
+
+void display(void)
+{
+//1s log message
+	if(one_sec_msg == true)
+		{
+			++count;
+
+			stream_sensor_data_forced_mode(&dev);
+			//for(int o = 0; o <= 10; o++)
+			//{
+			stream_accelerometer_data();
+			standardize_accel();
+			//}
+
+			format_count();
+			format_power();
+			format_bme280();
+			format_accel();
+
+			if(burn == false)
+			{
+				burn_signal();
+			}
+
+			lcd_out();
+
+			HAL_UART_Transmit(&huart1, (uint8_t*)comm, 91, 1000);
+			one_sec_msg = false;
+	}
+}
+
+
+void format_power(void)
+{
+//Format VOLTAGE
+
+	comm[88] = '.';
+	int dec = round((volt - (int)(volt))*10);
+
+	if(dec >= 10)
+	{
+		comm[87] = (int)(volt+1) + 48;
+		comm[89] = '0';
+	}
+	else
+	{
+		comm[87] = (int)(volt) + 48;
+		comm[89] = dec + 48;
+	}
+
+//Format CURRENT
+	current = (int)(avg_curr*1000);
+	if(current < 10)
+	{
+		comm[83] = ' ';
+		comm[84] = ' ';
+		comm[85] = (int) current + 48;
+	}
+	else if((current > 10) && (current < 100))
+	{
+		comm[83] = ' ';
+		comm[84] = (int)(current/10.0) + 48;
+		comm[85] = (int)((current/10.0 - (int)(current/10.0))*10) + 48;
+
+	}
+	else
+	{
+		comm[83] = (int)(current/100.0) + 48;
+		comm[84] = (int)(((int)current%100)/10) + 48;
+		comm[85] =(int)((int)current%10) + 48;
+	}
+}
+
+//SOURCED FROM E-DESIGN 314 TEST 2 & MODIFIED
+void burn_signal(void)
+{
+	double maximum = 18.9354;
+	double minimum = 17.976343;
+	double altitude = atof(ant_alt);
+
+    if (burnoffcounter > 0)
+    {
+        burnoffcounter--;
+        if (burnoffcounter == 0)
+        {
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+            burn = true;
+        }
+    }
+    else
+    {
+        if ( (valid == true) && (altitude >= 10000) && ( (lontd > maximum) || (lontd < minimum) ) )
+        {
+        	burntriggered = burntriggered + 1;
+        }
+		else
+		{
+            burntriggered = 0;
+		}
+
+        if (burntriggered >= 5)
+        {
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+            burnoffcounter = 10;
+            burntriggered = 0;
+            b = 11;
+        }
+    }
+}
+
+
+void adc_sb(void)
+{
+//ADC from PA0 <- voltage_divider <- load_voltage
+	sConfig1.Channel = ADC_CHANNEL_1;
+	HAL_ADC_ConfigChannel(&hadc1, &sConfig1);
+	HAL_ADC_Start(&hadc1); //start
+	if(HAL_ADC_PollForConversion(&hadc1, 5)== HAL_OK){
+		pa0_raw = HAL_ADC_GetValue(&hadc1);
+
+	}
+
+//ADC from PA1 <- OpAmp <- current_sensor <- load_current
+	sConfig2.Channel = ADC_CHANNEL_2;
+	HAL_ADC_ConfigChannel(&hadc1, &sConfig2);
+	HAL_ADC_Start(&hadc1); //start
+	if(HAL_ADC_PollForConversion(&hadc1, 5)== HAL_OK){
+		pa1_raw = HAL_ADC_GetValue(&hadc1);
+
+	}
+
+//Convert 8-bit level to voltage
+	pa0 = vdd*pa0_raw/num_bits;
+	pa1 = vdd*pa1_raw/num_bits;
+
+//Convert voltage to load_voltage
+	volt = pa0*(R3+R4)/R4;
+
+//Convert voltage to load_current
+	curr = pa1/((1+R1/R2)*0.01*Rout);
+
+//Get average_current as sum of >= 30 samples divided by #samples
+	tot_curr = tot_curr + curr;
+	sample++;
+	if(sample >= 30)
+	{
+		avg_curr = tot_curr/sample;
+		tot_curr = 0;
+		sample = 0;
+	}
+}
+
+
+void lcd_init(void)
+{
+
+//Init0
+//3x 8-bit mode set
+	//begin
+	HAL_Delay(15);
+
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);//RS
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);//RNW
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_SET); // E->1
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_RESET);//DB7
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10, GPIO_PIN_RESET);//DB6
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, GPIO_PIN_SET);//DB5 = 1 -> 8-bit mode
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);//DB4 = 1 -> 2 lines
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);//E -> 0
+
+	HAL_Delay(5);
+
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);//RS
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);//RNW
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_SET); // E->1
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_RESET);//DB7
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10, GPIO_PIN_RESET);//DB6
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, GPIO_PIN_SET);//DB5 = 1 -> 8-bit mode
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);//DB4 = 1 -> 2 lines
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);//E -> 0
+
+	HAL_Delay(1);
+
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);//RS
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);//RNW
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_SET); // E->1
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_RESET);//DB7
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10, GPIO_PIN_RESET);//DB6
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, GPIO_PIN_SET);//DB5 = 1 -> 8-bit mode
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);//DB4 = 1 -> 2 lines
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);//E -> 0
+
+	HAL_Delay(1);
+	//end
+
+//Init1
+	//4-bit mode
+	//000010
+	//begin
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);//RS
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);//RNW
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_SET); // E-> 1
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_RESET);//DB7
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10, GPIO_PIN_RESET);//DB6
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, GPIO_PIN_SET);//DB5 -> 1
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);//DB4
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);//E -> 0
+	//end
+
+	HAL_Delay(1);
+
+//Function Set (4-bit, 2-line, 5*7 dot font)
+	lcd_instr_write(0b00101000);
+//Display ON/OFF Control (display, cursor, and blinking = off)
+	lcd_instr_write(0b00001000);
+//Clear Display
+	lcd_instr_write(0b00000001);
+//Entry Mode Set (increment, and no display shift)
+	lcd_instr_write(0b00000110);
+//Display ON/OFF Control (display, cursor, and blinking = on)
+	lcd_instr_write(0b00001111);
+}
+
+
+void lcd_instr_write(uint8_t dbs)
+{
+//INSTR WRITE
+
+	user_delay(1);
+
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);//RS -> 0
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);//RNW -> 0
+
+	//UPPER NIBBLE
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_SET); // E-> 1
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, ((dbs&0b10000000)>>7) );//DB7
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10, ((dbs&0b01000000)>>6) );//DB6
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, ((dbs&0b00100000)>>5));//DB5
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, ((dbs&0b00010000)>>4));//DB4
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);//E -> 0
+
+	//LOWER NIBBLE
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_SET); // E-> 1
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, ((dbs&0b00001000)>>3));//DB7
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10, ((dbs&0b00000100)>>2));//DB6
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, ((dbs&0b00000010)>>1));//DB5
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, ((dbs&0b00000001)));//DB4
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);//E -> 0
+
+}
+
+
+void lcd_data_write(uint8_t data)
+{
+//DATA WRITE
+
+	user_delay(1);
+
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);//RS -> 1
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);//RNW -> 0
+
+	//UPPER NIBBLE
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_SET); // E-> 1
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, ((data&0b10000000)>>7) );//DB7
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10, ((data&0b01000000)>>6) );//DB6
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, ((data&0b00100000)>>5));//DB5
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, ((data&0b00010000)>>4));//DB4
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);//E -> 0
+
+	//LOWER NIBBLE
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_SET); // E-> 1
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, ((data&0b00001000)>>3));//DB7
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10, ((data&0b00000100)>>2));//DB6
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, ((data&0b00000010)>>1));//DB5
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, ((data&0b00000001)));//DB4
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);//E -> 0
+
+}
+
+
+void user_delay(uint32_t delay)
+{
+	int first_tick = HAL_GetTick();
+
+	while((HAL_GetTick() - first_tick) < delay)
+	{
+
+	}
+}
+
+
+void lcd_out(void)
+{
+//Clear Display
+	lcd_instr_write(1);
+//Set cursor to ADD = 0
+	lcd_instr_write(128+0);
+
+//Write ALTITUDE to LCD in Format "AAAAAm" ignoring
+	int n = 0;
+	while(n <= 4)
+	{
+		if(comm[75+n] != ' ')
+		{
+			if(comm[75+n] != '.')
+			{
+				lcd_data_write(comm[75+n]);
+			}
+			else
+			{
+				n = 6;
+			}
+		}
+		n++;
+	}
+	lcd_data_write('m');
+
+//Set cursor to ADD = 41
+	lcd_instr_write(128+40+1);
+//Write BURN STATUS to LCD in Format "B"
+	if(b > 0)
+	{
+		--b;
+		lcd_data_write('B');
+	}
+
+//Set cursor to ADD = 44
+	lcd_instr_write(128+40+4);
+//Write TEMPERATURE to LCD in Format "TTTC"
+	lcd_data_write(comm[25]);
+	lcd_data_write(comm[26]);
+	lcd_data_write(comm[27]);
+	lcd_data_write(0x43);
+}
+
+
+void sensor_init(void)
+{
+	if(HAL_I2C_IsDeviceReady(&hi2c1, (bme280_id<<1)&0xFE, 2, 100) == HAL_OK)
+	{
+
+	    dev.dev_id = BME280_I2C_ADDR_PRIM; //Address = 0X76 (SDO -> GND)
+	    dev.intf = BME280_I2C_INTF; //Set I2C Interface
+	    dev.read = user_i2c_read; //READ Function
+	    dev.write = user_i2c_write; //WRITE Function
+	    dev.delay_ms = user_delay; //DELAY Function
+
+	    bme280_init(&dev);
+
+	    /* Recommended mode of operation: Indoor navigation */
+		dev.settings.osr_h = BME280_OVERSAMPLING_1X;
+		dev.settings.osr_p = BME280_OVERSAMPLING_1X;
+		dev.settings.osr_t = BME280_OVERSAMPLING_1X;
+		dev.settings.filter = BME280_FILTER_COEFF_OFF;
+		dev.settings.standby_time = BME280_STANDBY_TIME_500_MS;
+
+		stream_sensor_data_forced_mode(&dev);
+	}
+
+	if(HAL_I2C_IsDeviceReady(&hi2c1, (lis2dh12_id<<1)&0xFE, 2, 100) == HAL_OK)
+	{
+
+		dev_ctx.write_reg = platform_write;
+		dev_ctx.read_reg = platform_read;
+		dev_ctx.handle = &hi2c1;
+
+		/*
+		lis2dh12_device_id_get(&dev_ctx, &whoamI);
+		if (whoamI != LIS2DH12_ID)
+		{
+			while(1)
+			{
+
+			}
+		}*/
+
+		lis2dh12_block_data_update_set(&dev_ctx, PROPERTY_ENABLE);
+		lis2dh12_data_rate_set(&dev_ctx, LIS2DH12_ODR_10Hz);
+		lis2dh12_full_scale_set(&dev_ctx, LIS2DH12_2g);
+		lis2dh12_temperature_meas_set(&dev_ctx, LIS2DH12_TEMP_DISABLE);
+		lis2dh12_operating_mode_set(&dev_ctx, LIS2DH12_NM_10bit);
+
+	}
+}
+
+
+int8_t user_i2c_read(uint8_t dev_id, uint8_t reg_addr, uint8_t *reg_data, uint16_t len)
+{
+    int8_t rslt = 0; /* Return 0 for Success, non-zero for failure */
+
+    /*
+     * HAL_I2C_Master_Transmit(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *pData, uint16_t Size, uint32_t Timeout)
+     * HAL_I2C_Master_Receive(I2C_HandleTypeDef *hi2c, uint16_t DevAddress, uint8_t *pData, uint16_t Size, uint32_t Timeout)
+     * The parameter dev_id can be used as a variable to store the I2C address of the device
+     */
+
+    /*
+     * Data on the bus should be like
+     * |------------+---------------------|
+     * | I2C action | Data                |
+     * |------------+---------------------|
+     * | Start      | -                   |
+     * | Write      | (reg_addr)          |
+     * | Stop       | -                   |
+     * | Start      | -                   |
+     * | Read       | (reg_data[0])       |
+     * | Read       | (....)              |
+     * | Read       | (reg_data[len - 1]) |
+     * | Stop       | -                   |
+     * |------------+---------------------|
+     */
+
+    HAL_I2C_Master_Transmit(&hi2c1, (dev_id<<1)&0xFE, &reg_addr, 1, 100);
+    HAL_I2C_Master_Receive(&hi2c1, ( ((dev_id<<1)&0xFE) + 1 ), reg_data, len, 100);
+
+    return rslt;
+}
+
+
+int8_t user_i2c_write(uint8_t dev_id, uint8_t reg_addr, uint8_t *reg_data, uint16_t len)
+{
+	int8_t rslt = 0; /* Return 0 for Success, non-zero for failure */
+
+	/*
+     * The parameter dev_id can be used as a variable to store the I2C address of the device
+     */
+
+    /*
+     * Data on the bus should be like
+     * |------------+---------------------|
+     * | I2C action | Data                |
+     * |------------+---------------------|
+     * | Start      | -                   |
+     * | Write      | (reg_addr)          |
+     * | Write      | (reg_data[0])       |
+     * | Write      | (....)              |
+     * | Write      | (reg_data[len - 1]) |
+     * | Stop       | -                   |
+     * |------------+---------------------|
+     */
+
+/*
+
+    int8_t *i2c_buff;
+    i2c_buff = malloc(len +1);
+    i2c_buff[0] = reg_addr;
+    memcpy(i2c_buff+1, reg_data, len);
+
+    HAL_I2C_Master_Transmit(&hi2c1, (dev_id<<1)&0b11111110, (uint8_t*)i2c_buff, len+1, 100);
+    free(i2c_buff);
+*/
+
+	HAL_I2C_Mem_Write(&hi2c1, (dev_id<<1)&0xFE, reg_addr, 1, reg_data, len, 100);
+
+    return rslt;
+}
+
+
+void stream_sensor_data_normal_mode(struct bme280_dev *dev)
+{
+	settings_sel = BME280_ALL_SETTINGS_SEL;
+	bme280_set_sensor_settings(settings_sel, dev);
+	bme280_set_sensor_mode(BME280_NORMAL_MODE, dev);
+	dev->delay_ms(70);
+	bme280_get_sensor_data(BME280_ALL, &comp_data, dev);
+}
+
+
+void stream_sensor_data_forced_mode(struct bme280_dev *dev)
+{
+    settings_sel = BME280_OSR_PRESS_SEL | BME280_OSR_TEMP_SEL | BME280_OSR_HUM_SEL | BME280_FILTER_SEL;
+    bme280_set_sensor_settings(settings_sel, dev);
+    bme280_set_sensor_mode(BME280_FORCED_MODE, dev);
+	dev->delay_ms(40);
+	bme280_get_sensor_data(BME280_ALL, &comp_data, dev);
+}
+
+
+void format_bme280(void)
+{
+	pres = comp_data.pressure;
+	temp = comp_data.temperature;
+	humd = comp_data.humidity;
+	pres /= 1000;
+
+	if(temp < 0)
+	{
+		comm[25] = '-';
+	}
+	else
+	{
+		comm[25] = ' ';
+	}
+	comm[26] = (int)(temp/10.0) + 48;
+	comm[27] = ((int)(temp))%10 + 48;
+
+	comm[29] = (int)(humd/100.0) + 48;
+	comm[30] = (int)( ( (int)(humd) %100 )/10.0) + 48;
+	comm[31] = (int)(((int)(humd)%10)) + 48;
+
+	comm[33] = (int)(pres/100.0) + 48;
+	comm[34] = (int)( ( (int)(pres) %100 )/10.0) + 48;
+	comm[35] = (int)(((int)(pres)%10)) + 48;
+}
+
+
+/*
+ * @brief  Write generic device register (platform dependent)
+ *
+ * @param  handle    customizable argument. In this examples is used in
+ *                   order to select the correct sensor bus handler.
+ * @param  reg       register to write
+ * @param  bufp      pointer to data to write in register reg
+ * @param  len       number of consecutive register to write
+ *
+ */
+int32_t platform_write(void *handle, uint8_t reg, uint8_t *bufp,uint16_t len)
+{
+  if (handle == &hi2c1)
+  {
+    /* Write multiple command */
+    reg |= 0x80;
+    HAL_I2C_Mem_Write(handle, LIS2DH12_I2C_ADD_L, reg,
+                      I2C_MEMADD_SIZE_8BIT, bufp, len, 1000);
+  }
+  return 0;
+}
+
+
+/*
+ * @brief  Read generic device register (platform dependent)
+ *
+ * @param  handle    customizable argument. In this examples is used in
+ *                   order to select the correct sensor bus handler.
+ * @param  reg       register to read
+ * @param  bufp      pointer to buffer that store the data read
+ * @param  len       number of consecutive register to read
+ *
+ */
+int32_t platform_read(void *handle, uint8_t reg, uint8_t *bufp,
+                             uint16_t len)
+{
+  if (handle == &hi2c1)
+  {
+    /* Read multiple command */
+    reg |= 0x80;
+    HAL_I2C_Mem_Read(handle, LIS2DH12_I2C_ADD_L, reg, I2C_MEMADD_SIZE_8BIT, bufp, len, 1000);
+  }
+  return 0;
+}
+
+
+void stream_accelerometer_data(void)
+{
+
+  /*
+   * Read samples in polling mode (no int)
+   * Read output only if new value available
+   */
+
+  lis2dh12_xl_data_ready_get(&dev_ctx, &reg.byte);
+
+  if (reg.byte)
+  {
+	  /* Read accelerometer data */
+	  memset(data_raw_acceleration.u8bit, 0x00, 3*sizeof(int16_t));
+	  lis2dh12_acceleration_raw_get(&dev_ctx, data_raw_acceleration.u8bit);
+
+	  acceleration_mg[0] =
+			  lis2dh12_from_fs2_hr_to_mg(data_raw_acceleration.i16bit[0]);
+
+	  acceleration_mg[1] =
+			  lis2dh12_from_fs2_hr_to_mg(data_raw_acceleration.i16bit[1]);
+
+	  acceleration_mg[2] =
+			  lis2dh12_from_fs2_hr_to_mg(data_raw_acceleration.i16bit[2]);
+  }
+}
+
+
+void standardize_accel(void)
+{
+	//++stndz;
+	magn = pow(acceleration_mg[0], 2) + pow(acceleration_mg[1], 2) + pow(acceleration_mg[2], 2);
+	magn = pow(magn, 0.5);
+
+	accx  = (float)(-1*acceleration_mg[2]/magn);
+	accy  = (float)(acceleration_mg[1]/magn);
+	accz  = (float)(-1*acceleration_mg[0]/magn);
+
+	stnd_x  = round(()*1000);
+	stnd_y = round((accy)*1000);
+	stnd_z = round((accz)*1000);
+/*
+	total_x += accx;
+	total_y += accy;
+	total_z += accz;
+
+	if(stndz >= 10)
+	{
+		stnd_x = round(total_x/stndz);
+		stnd_y = round(total_y/stndz);
+		stnd_z = round(total_z/stndz);
+		stndz = 0;
+		total_x = 0;
+		total_y = 0;
+		total_z = 0;
+	}
+	*/
+}
+
+
+void format_accel(void)
+{
+	if(stnd_x < 0)
+	{
+		comm[37] = '-';
+		stnd_x = -1*stnd_x;
+	}
+	else
+	{
+		comm[37] = ' ';
+	}
+
+	if(stnd_y < 0)
+	{
+		comm[42] = '-';
+		stnd_y = -1*stnd_y;
+	}
+	else
+	{
+		comm[42] = ' ';
+	}
+
+	if(stnd_z < 0)
+	{
+		comm[47] = '-';
+		stnd_z = -1*stnd_z;
+	}
+	else
+	{
+		comm[47] = ' ';
+	}
+
+	if(stnd_x >= 1000)
+	{
+		stnd_x = 999;
+	}
+
+	if(stnd_y >= 1000)
+	{
+		stnd_y = 999;
+	}
+
+	if(stnd_z >= 1000)
+	{
+		stnd_z = 999;
+	}
+
+	comm[38] = (int)(stnd_x/100) + 48;
+	comm[39] = (int)((stnd_x%100)/10) + 48;
+	comm[40] = stnd_x%10 + 48;
+
+	comm[43] = (int)(stnd_y/100) + 48;
+	comm[44] = (int)((stnd_y%100)/10) + 48;
+	comm[45] = stnd_y%10 + 48;
+
+	comm[48] = (int)(stnd_z/100) + 48;
+	comm[49] = (int)((stnd_z%100)/10) + 48;
+	comm[50] = stnd_z%10 + 48;
+}
