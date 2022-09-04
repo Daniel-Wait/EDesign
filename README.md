@@ -1,5 +1,5 @@
 # EDesign314 Embedded Programming
-High Altitude Logger.
+## High Altitude Logger
 
 3rd Year, 1st semester design project.
 
